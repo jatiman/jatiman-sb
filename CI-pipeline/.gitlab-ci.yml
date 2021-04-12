@@ -1,0 +1,48 @@
+stages:
+  - containerizing
+  - deploy
+
+variables:
+  IMAGE_TAG: ${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHA}
+
+image: docker:19.03
+services:
+  - docker:19.03-dind
+
+docker-dev-build:
+  stage: containerizing
+  #variables:
+  #  DOCKER_HOST: tcp://localhost:2375
+  #  DOCKER_TLS_CERTDIR: ""
+  script:
+    - docker info
+    - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
+    - docker build -t ${IMAGE_TAG} .
+    - docker push ${IMAGE_TAG}
+#limit to only run pipeline in from development
+  only:
+    - development
+  
+deploy:
+  stage: deploy
+  image: alpine
+  variables:
+    CONTAINER_NAME: "hello-container"
+  before_script:
+    - apk add openssh-client
+    - eval $(ssh-agent -s)
+    - echo "${DEPLOYER_KEY}" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
+    - chmod 600 ~/.ssh/config
+  script:
+    - ssh -p${PROD_TARGET_PORT} ${PROD_TARGET_USER}@${PROD_TARGET_IP} "docker inspect --format='{{.Config.Image}}' ${CONTAINER_NAME} > \$HOME/imagename"
+    - ssh -p${PROD_TARGET_PORT} ${PROD_TARGET_USER}@${PROD_TARGET_IP} "docker run --name ${CONTAINER_NAME}-0 -dit -p ${PROD_EXPOSE_BAK}:8002 \$(cat \$HOME/imagename)"
+    - sleep 15
+    - ssh -p${PROD_TARGET_PORT} ${PROD_TARGET_USER}@${PROD_TARGET_IP} "if [ \$(curl --write-out '%{http_code}' --silent --output /PROD/null localhost:${PROD_EXPOSE_BAK}) -eq 200 ]; then docker stop ${CONTAINER_NAME} && docker rm ${CONTAINER_NAME}; else docker stop ${CONTAINER_NAME}-0 && docker rm ${CONTAINER_NAME}-0; exit 1; fi"
+    - ssh -p${PROD_TARGET_PORT} ${PROD_TARGET_USER}@${PROD_TARGET_IP} "docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY} && docker run --name ${CONTAINER_NAME} -dit -p ${PROD_EXPOSE_PRIM}:8002 ${IMAGE_TAG}"
+    - sleep 15
+    - ssh -p${PROD_TARGET_PORT} ${PROD_TARGET_USER}@${PROD_TARGET_IP} "if [ \$(curl --write-out '%{http_code}' --silent --output /PROD/null localhost:${PROD_EXPOSE_PRIM}) -eq 200 ]; then docker stop ${CONTAINER_NAME}-0 && docker rm ${CONTAINER_NAME}-0; else docker stop ${CONTAINER_NAME} && docker rm ${CONTAINER_NAME}; docker run --name ${CONTAINER_NAME} -dit -p ${PROD_EXPOSE_PRIM}:8002 \$(cat \$HOME/imagename); docker stop ${CONTAINER_NAME}-0 && docker rm ${CONTAINER_NAME}-0; exit 1; fi"
+  only:
+    - development
